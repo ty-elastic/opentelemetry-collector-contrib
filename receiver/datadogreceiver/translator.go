@@ -21,8 +21,13 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
+
+	//"strconv"
+	"encoding/hex"
 
 	"github.com/DataDog/datadog-agent/pkg/trace/pb"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -30,10 +35,10 @@ import (
 	semconv "go.opentelemetry.io/collector/semconv/v1.16.0"
 )
 
-func addResourceData(req *http.Request, rs *pcommon.Resource) {
+func addResourceData(req *http.Request, serviceName string, rs *pcommon.Resource) {
 	attrs := rs.Attributes()
 	attrs.Clear()
-	attrs.EnsureCapacity(3)
+	attrs.EnsureCapacity(4)
 	attrs.PutStr("telemetry.sdk.name", "Datadog")
 	ddTracerVersion := req.Header.Get("Datadog-Meta-Tracer-Version")
 	if ddTracerVersion != "" {
@@ -43,6 +48,7 @@ func addResourceData(req *http.Request, rs *pcommon.Resource) {
 	if ddTracerLang != "" {
 		attrs.PutStr("telemetry.sdk.language", ddTracerLang)
 	}
+	attrs.PutStr(semconv.AttributeServiceName, serviceName)
 }
 
 func toTraces(payload *pb.TracerPayload, req *http.Request) ptrace.Traces {
@@ -53,9 +59,9 @@ func toTraces(payload *pb.TracerPayload, req *http.Request) ptrace.Traces {
 	dest := ptrace.NewTraces()
 	resSpans := dest.ResourceSpans().AppendEmpty()
 	resource := resSpans.Resource()
-	addResourceData(req, &resource)
 	resSpans.SetSchemaUrl(semconv.SchemaURL)
 
+	setServiceName := false
 	for _, trace := range traces {
 		ils := resSpans.ScopeSpans().AppendEmpty()
 		ils.Scope().SetName("Datadog-" + req.Header.Get("Datadog-Meta-Lang"))
@@ -65,7 +71,12 @@ func toTraces(payload *pb.TracerPayload, req *http.Request) ptrace.Traces {
 		for _, span := range trace {
 			newSpan := spans.AppendEmpty()
 
-			newSpan.SetTraceID(uInt64ToTraceID(0, span.TraceID))
+			// _dd.p.tid holds the upper 64bits of a 128bit trace ID
+			if span.Meta["_dd.p.tid"] != "" {
+				newSpan.SetTraceID(make128TraceID(span.Meta["_dd.p.tid"], span.TraceID))
+			} else {
+				newSpan.SetTraceID(uInt64ToTraceID(0, span.TraceID))
+			}
 			newSpan.SetSpanID(uInt64ToSpanID(span.SpanID))
 			newSpan.SetStartTimestamp(pcommon.Timestamp(span.Start))
 			newSpan.SetEndTimestamp(pcommon.Timestamp(span.Start + span.Duration))
@@ -78,14 +89,10 @@ func toTraces(payload *pb.TracerPayload, req *http.Request) ptrace.Traces {
 				newSpan.Status().SetCode(ptrace.StatusCodeOk)
 			}
 
-			attrs := newSpan.Attributes()
-			attrs.EnsureCapacity(len(span.GetMeta()) + 1)
-			attrs.PutStr(semconv.AttributeServiceName, span.Service)
-			for k, v := range span.GetMeta() {
-				k = translateDataDogKeyToOtel(k)
-				if len(k) > 0 {
-					attrs.PutStr(k, v)
-				}
+			// OTel requires serviceName to be a resource attribute
+			if !setServiceName {
+				addResourceData(req, span.Service, &resource)
+				setServiceName = true
 			}
 
 			if span.Meta["span.kind"] != "" {
@@ -113,6 +120,8 @@ func toTraces(payload *pb.TracerPayload, req *http.Request) ptrace.Traces {
 					newSpan.SetKind(ptrace.SpanKindUnspecified)
 				}
 			}
+
+			translateDataDogMetaToOtel(&newSpan, span)
 		}
 		spans.MoveAndAppendTo(ils.Spans())
 	}
@@ -120,30 +129,95 @@ func toTraces(payload *pb.TracerPayload, req *http.Request) ptrace.Traces {
 	return dest
 }
 
-func translateDataDogKeyToOtel(k string) string {
-	switch strings.ToLower(k) {
-	case "env":
-		return semconv.AttributeDeploymentEnvironment
-	case "version":
-		return semconv.AttributeServiceVersion
-	case "container_id":
-		return semconv.AttributeContainerID
-	case "container_name":
-		return semconv.AttributeContainerName
-	case "image_name":
-		return semconv.AttributeContainerImageName
-	case "image_tag":
-		return semconv.AttributeContainerImageTag
-	case "process_id":
-		return semconv.AttributeProcessPID
-	case "error.stacktrace":
-		return semconv.AttributeExceptionStacktrace
-	case "error.msg":
-		return semconv.AttributeExceptionMessage
-	default:
-		return k
-	}
+func translateDataDogMetaToOtel(newSpan *ptrace.Span, span *pb.Span) {
+	attrs := newSpan.Attributes()
+	attrs.EnsureCapacity(len(span.GetMeta()))
 
+	for k, v := range span.GetMeta() {
+		switch strings.ToLower(k) {
+		case "env":
+			attrs.PutStr(semconv.AttributeDeploymentEnvironment, v)
+		case "version":
+			attrs.PutStr(semconv.AttributeServiceVersion, v)
+		case "container_id":
+			attrs.PutStr(semconv.AttributeContainerID, v)
+		case "container_name":
+			attrs.PutStr(semconv.AttributeContainerName, v)
+		case "image_name":
+			attrs.PutStr(semconv.AttributeContainerImageName, v)
+		case "image_tag":
+			attrs.PutStr(semconv.AttributeContainerImageTag, v)
+		case "process_id":
+			attrs.PutStr(semconv.AttributeProcessPID, v)
+		case "thread.name":
+			attrs.PutStr(semconv.AttributeThreadName, v)
+		case "http.status_code":
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				attrs.PutInt(semconv.AttributeHTTPStatusCode, int64(n))
+			}
+		case "error.stacktrace":
+			attrs.PutStr(semconv.AttributeExceptionStacktrace, v)
+		case "error.msg":
+			attrs.PutStr(semconv.AttributeExceptionMessage, v)
+		case "_dd.p.tid":
+			// already copied to spanid
+		case "b3.traceid":
+			// drop
+		case "b3.spanid":
+			// drop
+		case "service.name":
+			// already copied to resource
+		case "span.kind":
+			// already copied to span
+		case "http.useragent":
+			attrs.PutStr("user_agent.original", v)
+			attrs.PutStr(semconv.AttributeHTTPUserAgent, v)
+		case "peer.ipv4":
+			if newSpan.Kind() == ptrace.SpanKindServer {
+				attrs.PutStr(semconv.AttributeHTTPClientIP, v)
+			} else {
+				attrs.PutStr(k, v)
+			}
+		case "http.hostname":
+			attrs.PutStr(semconv.AttributeNetHostName, v)
+		case "http.route":
+			if newSpan.Kind() == ptrace.SpanKindServer {
+				attrs.PutStr(semconv.AttributeHTTPRoute, v)
+			} else {
+				attrs.PutStr(k, v)
+			}
+		case "http.method":
+			attrs.PutStr(semconv.AttributeHTTPMethod, v)
+			attrs.PutStr(semconv.AttributeNetAppProtocolName, "http")
+		case "servlet.path":
+			if newSpan.Kind() == ptrace.SpanKindServer {
+				attrs.PutStr(semconv.AttributeHTTPTarget, v)
+			} else {
+				attrs.PutStr(k, v)
+			}
+		case "http.url":
+			if newSpan.Kind() == ptrace.SpanKindServer {
+				url, err := url.Parse(v)
+				if err == nil {
+					attrs.PutStr(semconv.AttributeHTTPScheme, url.Scheme)
+					if span.GetMeta()["http.hostname"] == "" {
+						attrs.PutStr(semconv.AttributeNetHostName, url.Hostname())
+					}
+					attrs.PutStr(semconv.AttributeNetHostPort, url.Port())
+					if span.GetMeta()["servlet.path"] == "" {
+						attrs.PutStr(semconv.AttributeHTTPTarget, url.Path)
+					}
+				}
+			} else if newSpan.Kind() == ptrace.SpanKindClient {
+				attrs.PutStr(semconv.AttributeHTTPURL, v)
+			} else {
+				attrs.PutStr(k, v)
+			}
+		default:
+			attrs.PutStr(k, v)
+		}
+	}
 }
 
 var bufferPool = sync.Pool{
@@ -280,6 +354,16 @@ func getMediaType(req *http.Request) string {
 		return "application/json"
 	}
 	return mt
+}
+
+func make128TraceID(high string, low uint64) pcommon.TraceID {
+	traceID := [16]byte{}
+	_, err := hex.Decode(traceID[:8], []byte(high))
+	if err != nil {
+		panic(err)
+	}
+	binary.BigEndian.PutUint64(traceID[8:], low)
+	return traceID
 }
 
 func uInt64ToTraceID(high, low uint64) pcommon.TraceID {
