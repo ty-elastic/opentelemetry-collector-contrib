@@ -30,10 +30,10 @@ import (
 	semconv "go.opentelemetry.io/collector/semconv/v1.16.0"
 )
 
-func addResourceData(req *http.Request, rs *pcommon.Resource) {
+func addResourceData(req *http.Request, serviceName string, rs *pcommon.Resource) {
 	attrs := rs.Attributes()
 	attrs.Clear()
-	attrs.EnsureCapacity(3)
+	attrs.EnsureCapacity(4)
 	attrs.PutStr("telemetry.sdk.name", "Datadog")
 	ddTracerVersion := req.Header.Get("Datadog-Meta-Tracer-Version")
 	if ddTracerVersion != "" {
@@ -43,6 +43,7 @@ func addResourceData(req *http.Request, rs *pcommon.Resource) {
 	if ddTracerLang != "" {
 		attrs.PutStr("telemetry.sdk.language", ddTracerLang)
 	}
+	attrs.PutStr(semconv.AttributeServiceName, serviceName)
 }
 
 func toTraces(payload *pb.TracerPayload, req *http.Request) ptrace.Traces {
@@ -53,9 +54,9 @@ func toTraces(payload *pb.TracerPayload, req *http.Request) ptrace.Traces {
 	dest := ptrace.NewTraces()
 	resSpans := dest.ResourceSpans().AppendEmpty()
 	resource := resSpans.Resource()
-	addResourceData(req, &resource)
 	resSpans.SetSchemaUrl(semconv.SchemaURL)
 
+	addResourceAttributes := false
 	for _, trace := range traces {
 		ils := resSpans.ScopeSpans().AppendEmpty()
 		ils.Scope().SetName("Datadog-" + req.Header.Get("Datadog-Meta-Lang"))
@@ -71,6 +72,11 @@ func toTraces(payload *pb.TracerPayload, req *http.Request) ptrace.Traces {
 			newSpan.SetEndTimestamp(pcommon.Timestamp(span.Start + span.Duration))
 			newSpan.SetParentSpanID(uInt64ToSpanID(span.ParentID))
 			newSpan.SetName(span.Resource)
+			// OTel requires service.name to be set on the resource
+			if !addResourceAttributes {
+				addResourceData(req, span.Service, &resource)
+				addResourceAttributes = true
+			}
 
 			if span.Error > 0 {
 				newSpan.Status().SetCode(ptrace.StatusCodeError)
@@ -80,7 +86,6 @@ func toTraces(payload *pb.TracerPayload, req *http.Request) ptrace.Traces {
 
 			attrs := newSpan.Attributes()
 			attrs.EnsureCapacity(len(span.GetMeta()) + 1)
-			attrs.PutStr(semconv.AttributeServiceName, span.Service)
 			for k, v := range span.GetMeta() {
 				k = translateDataDogKeyToOtel(k)
 				if len(k) > 0 {
