@@ -17,6 +17,7 @@ package datadogreceiver // import "github.com/open-telemetry/opentelemetry-colle
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"mime"
@@ -65,7 +66,12 @@ func toTraces(payload *pb.TracerPayload, req *http.Request) ptrace.Traces {
 		for _, span := range trace {
 			newSpan := spans.AppendEmpty()
 
-			newSpan.SetTraceID(uInt64ToTraceID(0, span.TraceID))
+			// _dd.p.tid holds the upper 64bits of a 128bit trace ID
+			if span.Meta["_dd.p.tid"] != "" {
+				newSpan.SetTraceID(make128TraceID(span.Meta["_dd.p.tid"], span.TraceID))
+			} else {
+				newSpan.SetTraceID(uInt64ToTraceID(0, span.TraceID))
+			}
 			newSpan.SetSpanID(uInt64ToSpanID(span.SpanID))
 			newSpan.SetStartTimestamp(pcommon.Timestamp(span.Start))
 			newSpan.SetEndTimestamp(pcommon.Timestamp(span.Start + span.Duration))
@@ -280,6 +286,16 @@ func getMediaType(req *http.Request) string {
 		return "application/json"
 	}
 	return mt
+}
+
+func make128TraceID(high string, low uint64) pcommon.TraceID {
+	traceID := [16]byte{}
+	_, err := hex.Decode(traceID[:8], []byte(high))
+	if err != nil {
+		panic(err)
+	}
+	binary.BigEndian.PutUint64(traceID[8:], low)
+	return traceID
 }
 
 func uInt64ToTraceID(high, low uint64) pcommon.TraceID {
